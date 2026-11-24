@@ -72,6 +72,12 @@ pub struct Config {
     /// How far the right stick goes for a mouse speed: 1.0 = full deflection at 4000 mouse
     /// counts a second.
     pub mouse_sensitivity: f32,
+    /// false: a title's own stall watchdog is taken out of its code in memory before it starts
+    /// (`loader::stall_watchdog_off`; the game folder is not touched). A retail game ends itself
+    /// with a write to address 0 when its main thread has not ticked for 30 s, and a first run's
+    /// pipeline builds stall it longer than that while the world loads. `XCL_STALL_WATCHDOG=0`
+    /// does the same for one run.
+    pub stall_watchdog: bool,
 }
 
 impl Config {
@@ -187,6 +193,7 @@ impl Default for Config {
             xbox_live_tokens: false,
             keyboard_mouse: true,
             mouse_sensitivity: 1.0,
+            stall_watchdog: true,
         }
     }
 }

@@ -331,6 +331,43 @@ unsafe extern "system" fn main_thread(param: *mut c_void) -> u32 {
     f(peb() as *mut c_void)
 }
 
+/// Where a retail game's stall watchdog decides to end the title (a write to address 0 from a
+/// thread that looks once a second): (RVA, the two bytes of the conditional jump there). The
+/// first is taken when a timed scope is 300 s old, the second when the main thread's heartbeat
+/// has not changed for 30 looks. As two NOPs neither is ever taken; the watchdog goes on looking.
+const STALL_WATCHDOG_JUMPS: [(usize, [u8; 2]); 2] = [(0x2215BDC, [0x73, 0x2E]), (0x2215C70, [0x74, 0x04])];
+
+/// `expect` at `at` replaced by two NOPs (memory of this process, made writable for it); false
+/// and nothing written when other bytes are there.
+unsafe fn nop_jump(at: usize, expect: [u8; 2]) -> bool {
+    use windows_sys::Win32::System::Memory::{VirtualProtect, PAGE_EXECUTE_READWRITE};
+    if !crate::gpu::shader::readable(at, 2) || std::slice::from_raw_parts(at as *const u8, 2) != expect {
+        return false;
+    }
+    let mut old = 0u32;
+    if VirtualProtect(at as *const c_void, 2, PAGE_EXECUTE_READWRITE, &mut old) == 0 {
+        return false;
+    }
+    std::ptr::write_volatile(at as *mut [u8; 2], [0x90, 0x90]);
+    VirtualProtect(at as *const c_void, 2, old, &mut old);
+    true
+}
+
+/// The title's stall watchdog taken out (`Config::stall_watchdog`): only when both jumps are
+/// where this build of the title has them, else nothing is changed (another title or version).
+unsafe fn stall_watchdog_off(m: &MappedModule) {
+    let there = STALL_WATCHDOG_JUMPS.iter().all(|&(rva, bytes)| {
+        let at = m.base + rva;
+        crate::gpu::shader::readable(at, 2) && std::slice::from_raw_parts(at as *const u8, 2) == bytes
+    });
+    if !there {
+        crate::xlog_warn!("stall watchdog: {} does not have the known watchdog's code – nothing changed", m.name);
+        return;
+    }
+    let done = STALL_WATCHDOG_JUMPS.iter().filter(|&&(rva, bytes)| nop_jump(m.base + rva, bytes)).count();
+    crate::xlog_info!("stall watchdog: {} – {done} of {} decisions taken out in memory (the title no longer ends itself when its main thread stalls)", m.name, STALL_WATCHDOG_JUMPS.len());
+}
+
 /// Make the game the "main image" of the process and run its entry point on a thread
 /// with the stack size its PE header asks for. Usually never returns (the game calls
 /// ExitProcess); if the entry returns, its value is returned.
@@ -347,6 +384,13 @@ pub fn run_main(m: &Arc<MappedModule>) -> u32 {
             *(peb().add(0x10) as *mut usize) = m.base;
         }
         run_tls_callbacks(m, 1);
+        let off = match std::env::var("XCL_STALL_WATCHDOG") {
+            Ok(v) => v.trim() == "0",
+            Err(_) => !crate::state::config().stall_watchdog,
+        };
+        if off {
+            stall_watchdog_off(m);
+        }
     }
     READY.store(true, Ordering::Release);
     let stack = (m.stack_reserve as usize).max(1 << 20);
@@ -422,6 +466,24 @@ pub fn on_tls_event(reason: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The watchdog's jumps are replaced only where the expected bytes are; other code stays.
+    #[test]
+    fn a_jump_is_taken_out_only_where_it_is() {
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_RELEASE};
+        unsafe {
+            let p = VirtualAlloc(std::ptr::null(), 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) as *mut u8;
+            assert!(!p.is_null());
+            std::slice::from_raw_parts_mut(p, 6).copy_from_slice(&[0xFF, 0xCD, 0x74, 0x04, 0x89, 0xEB]);
+            assert!(!nop_jump(p as usize + 2, [0x73, 0x2E]), "other bytes there: nothing written");
+            assert_eq!(std::slice::from_raw_parts(p, 6), [0xFF, 0xCD, 0x74, 0x04, 0x89, 0xEB]);
+            assert!(nop_jump(p as usize + 2, [0x74, 0x04]));
+            assert_eq!(std::slice::from_raw_parts(p, 6), [0xFF, 0xCD, 0x90, 0x90, 0x89, 0xEB]);
+            assert!(!nop_jump(p as usize + 2, [0x74, 0x04]), "already taken out");
+            assert!(!nop_jump(0x10, [0x74, 0x04]), "an address that is not memory");
+            VirtualFree(p as *mut c_void, 0, MEM_RELEASE);
+        }
+    }
 
     /// A PE32+ DLL of one section (.text at RVA 0x1000) holding `code`, its entry point at the
     /// start of it, preferred at `image_base` and relocatable (one empty block at RVA 0x1100);
