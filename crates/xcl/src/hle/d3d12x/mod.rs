@@ -41,6 +41,7 @@ pub mod pso_async;
 pub mod real;
 mod scatter;
 mod shader_cache_session;
+mod shader_code;
 mod sharded;
 pub mod sparse;
 mod standin;
