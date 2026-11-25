@@ -54,6 +54,12 @@ pub(super) fn build_is_wanted() -> bool {
 /// Whether one of the title's threads waits for what this thread is doing, to be asked later and
 /// from another thread: a worker's build as `build_is_wanted`; a thread that is not XCL's is the
 /// title's own.
+/// This thread is a worker building a graphics pipeline (its shaders are compiled ahead of
+/// compute programs': `dxc::compile`).
+pub fn building_graphics_here() -> bool {
+    BUILDING.with(|b| b.borrow().as_ref().is_some_and(|p| !p.compute))
+}
+
 pub fn wanted_here() -> crate::gpu::recomp::dxc::Wanted {
     if let Some(p) = BUILDING.with(|b| b.borrow().clone()) {
         return Box::new(move || p.demand.lock().unwrap().wanted);
@@ -63,8 +69,24 @@ pub fn wanted_here() -> crate::gpu::recomp::dxc::Wanted {
 }
 
 /// A worker's build of `p` (`preload`: by one of the lowest-priority workers).
+/// (diagnostic) builds running now: [graphics, compute]
+static RUNNING: [AtomicUsize; 2] = [AtomicUsize::new(0), AtomicUsize::new(0)];
+
+/// (diagnostic) Pipelines the title has bound that are not built yet – (graphics, compute) –
+/// and the builds running now – (graphics, compute).
+pub fn wanted_backlog() -> ((usize, usize), (usize, usize)) {
+    let mut w = (0, 0);
+    PENDING.for_each(|_, p| {
+        if p.used.load(Ordering::Relaxed) && !p.orphan.load(Ordering::Relaxed) && !*p.done.lock().unwrap() {
+            if p.compute { w.1 += 1 } else { w.0 += 1 }
+        }
+    });
+    (w, (RUNNING[0].load(Ordering::Relaxed), RUNNING[1].load(Ordering::Relaxed)))
+}
+
 fn build(p: &Arc<Pending>, job: Job, preload: bool) {
     use windows_sys::Win32::System::Threading::{GetCurrentThread, GetCurrentThreadId, SetThreadPriority, THREAD_PRIORITY_LOWEST, THREAD_PRIORITY_NORMAL};
+    RUNNING[p.compute as usize].fetch_add(1, Ordering::Relaxed);
     BUILDING.with(|b| *b.borrow_mut() = Some(p.clone()));
     if preload {
         let mut d = p.demand.lock().unwrap();
@@ -74,6 +96,7 @@ fn build(p: &Arc<Pending>, job: Job, preload: bool) {
         }
     }
     complete(p, job());
+    RUNNING[p.compute as usize].fetch_sub(1, Ordering::Relaxed);
     if preload {
         // (under the lock: `want` does not raise this thread after it)
         let mut d = p.demand.lock().unwrap();
@@ -104,7 +127,7 @@ impl Pending {
     }
 
     fn note_use(&self) {
-        if self.key != 0 && !self.used.swap(true, Ordering::Relaxed) {
+        if !self.used.swap(true, Ordering::Relaxed) && self.key != 0 {
             used::note(self.key);
         }
     }
@@ -169,16 +192,24 @@ pub fn enabled() -> bool {
 /// Builds the real pipeline: its raw pointer, 0 = failed.
 pub type Job = Box<dyn FnOnce() -> usize + Send>;
 
-fn queue() -> &'static Mutex<mpsc::Sender<Arc<Pending>>> {
-    static Q: OnceLock<Mutex<mpsc::Sender<Arc<Pending>>>> = OnceLock::new();
-    Q.get_or_init(|| {
+/// The workers' queue for a compute pipeline, or for a graphics one. Graphics pipelines have
+/// workers of their own: in one queue with compute, a retail title's world had about 250
+/// graphics pipelines it had drawn with waiting – one being built – while 45 builds of compute
+/// programs (tens of seconds each in the driver) held every worker, and the frames it showed
+/// had no scene.
+fn queue(compute: bool) -> &'static Mutex<mpsc::Sender<Arc<Pending>>> {
+    static Q: [OnceLock<Mutex<mpsc::Sender<Arc<Pending>>>>; 2] = [OnceLock::new(), OnceLock::new()];
+    Q[compute as usize].get_or_init(|| {
         let (tx, rx) = mpsc::channel::<Arc<Pending>>();
         let rx = Arc::new(Mutex::new(rx));
         // translation recurses deeply on big programs; DXC itself runs on its own pool
         let n = crate::gpu::recomp::dxc::compile_threads();
+        // (as many for each: a worker that waits costs nothing, and the driver compiles are
+        // counted where they are made – `real::compile_slots`)
+        let name = if compute { "xcl-pso" } else { "xcl-pso-gfx" };
         for k in 0..n {
             let rx = rx.clone();
-            let _ = std::thread::Builder::new().name(format!("xcl-pso-{k}")).stack_size(64 << 20).spawn(move || loop {
+            let _ = std::thread::Builder::new().name(format!("{name}-{k}")).stack_size(64 << 20).spawn(move || loop {
                 let next = rx.lock().unwrap().recv();
                 let Ok(p) = next else { return };
                 // (None: a bind took it and builds it itself)
@@ -240,10 +271,13 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64) {
         crate::xlog_info!("D3D12.X: pipelines whose shaders are not compiled yet get a stand-in and are built in the background");
     });
     if send {
-        let _ = queue().lock().unwrap().send(p);
-    } else if used::known(key) {
+        let _ = queue(p.compute).lock().unwrap().send(p);
+    } else if used::known(key) || (compute && early_compute()) {
         if let Some(q) = preload() {
-            q.list.lock().unwrap().push_back(p);
+            // (graphics ahead of compute, as on the workers: `queue`)
+            let mut list = q.list.lock().unwrap();
+            if p.compute { list.push_back(p) } else { list.push_front(p) }
+            drop(list);
             q.cv.notify_one();
         }
     }
@@ -329,6 +363,118 @@ mod used {
     }
 }
 
+/// A lazy compute pipeline is built ahead from the moment the title makes it
+/// (`XCL_EARLY_COMPUTE_PSO=0`: off). A bind waits for a compute pipeline, so built only at their
+/// first bind they are compiled one after another: measured on a retail title entering its
+/// world, 249 of them took the driver 352 s (one up to 43 s) with one thread compiling and the
+/// other cores idle.
+fn early_compute() -> bool {
+    static E: OnceLock<bool> = OnceLock::new();
+    *E.get_or_init(|| !std::env::var("XCL_EARLY_COMPUTE_PSO").is_ok_and(|v| v.trim() == "0"))
+}
+
+/// How many workers build pipelines ahead on a machine with `threads` compile threads
+/// (`XCL_PSO_AHEAD_THREADS`): half of them, so that the title's own threads keep their cores.
+fn ahead_threads(threads: usize) -> usize {
+    static N: OnceLock<Option<usize>> = OnceLock::new();
+    let set = *N.get_or_init(|| std::env::var("XCL_PSO_AHEAD_THREADS").ok().and_then(|v| v.trim().parse().ok()).filter(|&n| n > 0));
+    set.unwrap_or((threads / 2).clamp(2, 16))
+}
+
+/// How many of the workers that build ahead run at once follows the processors that are idle
+/// (`XCL_PSO_AUTOSCALE=0`: all of them, always). They are the only work here nothing waits
+/// for, and with every one of them building while the title's threads, the wanted builds and
+/// the compilers were busy too, the machine had more runnable threads than processors and the
+/// builds the title waited for got a share of a processor each.
+mod cpu_scale {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Condvar, Mutex, OnceLock};
+
+    /// builds ahead allowed at once now
+    static CAP: AtomicUsize = AtomicUsize::new(usize::MAX);
+    static RUNNING: Mutex<usize> = Mutex::new(0);
+    static FREED: Condvar = Condvar::new();
+
+    /// The next cap, from the share of processor time that was idle (0 – 100): one more with a
+    /// fifth of the processors idle, one fewer with less than a twelfth, never under 1 nor over `most`.
+    pub fn next_cap(cap: usize, idle: u32, most: usize) -> usize {
+        let most = most.max(1);
+        match idle {
+            20.. => (cap + 1).min(most),
+            0..=7 => cap.saturating_sub(1).max(1),
+            _ => cap.clamp(1, most),
+        }
+    }
+
+    /// Idle and total processor time so far, in 100 ns over all processors.
+    fn times() -> Option<(u64, u64)> {
+        use windows_sys::Win32::Foundation::FILETIME;
+        use windows_sys::Win32::System::Threading::GetSystemTimes;
+        let z = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+        let (mut idle, mut kernel, mut user) = (z, z, z);
+        if unsafe { GetSystemTimes(&mut idle, &mut kernel, &mut user) } == 0 {
+            return None;
+        }
+        let v = |f: FILETIME| (f.dwHighDateTime as u64) << 32 | f.dwLowDateTime as u64;
+        // (kernel time includes idle time)
+        Some((v(idle), v(kernel) + v(user)))
+    }
+
+    /// Start following the machine, for `most` workers.
+    pub fn start(most: usize) {
+        static ONCE: OnceLock<()> = OnceLock::new();
+        ONCE.get_or_init(|| {
+            if std::env::var("XCL_PSO_AUTOSCALE").is_ok_and(|v| v.trim() == "0") {
+                return;
+            }
+            CAP.store((most / 2).max(1), Ordering::Relaxed);
+            let _ = std::thread::Builder::new().name("xcl-pso-scale".into()).spawn(move || {
+                let mut before = times();
+                let mut told = 0;
+                loop {
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                    let now = times();
+                    if let (Some((i0, t0)), Some((i1, t1))) = (before, now) {
+                        if t1 > t0 {
+                            let idle = ((i1 - i0) * 100 / (t1 - t0)).min(100) as u32;
+                            let cap = next_cap(CAP.load(Ordering::Relaxed), idle, most);
+                            if CAP.swap(cap, Ordering::Relaxed) != cap {
+                                FREED.notify_all();
+                                if cap == 1 || cap == most {
+                                    if told != cap {
+                                        told = cap;
+                                        crate::xlog_info!("D3D12.X: {cap} of {most} workers build pipelines ahead now ({idle} % of the processors idle)");
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    before = now;
+                }
+            });
+        });
+    }
+
+    pub struct Turn;
+
+    /// Wait until a build ahead may run.
+    pub fn turn() -> Turn {
+        let mut n = RUNNING.lock().unwrap();
+        while *n >= CAP.load(Ordering::Relaxed) {
+            n = FREED.wait_timeout(n, std::time::Duration::from_millis(250)).unwrap().0;
+        }
+        *n += 1;
+        Turn
+    }
+
+    impl Drop for Turn {
+        fn drop(&mut self) {
+            *RUNNING.lock().unwrap() -= 1;
+            FREED.notify_one();
+        }
+    }
+}
+
 /// The workers that build the pipelines of an earlier run ahead of their first use
 /// (`XCL_PSO_PRELOAD=0`: off). Apart from the ones a bind sends to (`queue`) and at the lowest
 /// priority: a pipeline that is bound is not held up by the ones made ahead (whoever takes
@@ -350,7 +496,8 @@ fn preload() -> Option<&'static Preload> {
         })
         .as_ref()?;
     STARTED.call_once(|| {
-        let n = (crate::gpu::recomp::dxc::compile_threads() / 4).clamp(2, 4);
+        let n = ahead_threads(crate::gpu::recomp::dxc::compile_threads());
+        cpu_scale::start(n);
         for k in 0..n {
             let _ = std::thread::Builder::new().name(format!("xcl-pso-pre-{k}")).stack_size(64 << 20).spawn(move || {
                 unsafe {
@@ -375,6 +522,8 @@ fn preload() -> Option<&'static Preload> {
                     // (None: a bind took it and builds it itself)
                     let job = p.job.lock().unwrap().take();
                     if let Some(job) = job {
+                        // (one the title already waits for does not wait for a processor)
+                        let _turn = (!p.demand.lock().unwrap().wanted).then(cpu_scale::turn);
                         build(&p, job, true);
                         let n = DONE.fetch_add(1, Ordering::Relaxed) + 1;
                         if n.is_power_of_two() {
@@ -494,6 +643,37 @@ mod used_tests {
     /// A lazy pipeline of shaders an earlier run used is built without a bind; another one is
     /// built only at its first use, and that use is kept for the next run.
     #[test]
+    fn the_builds_ahead_at_once_follow_the_idle_processors() {
+        use cpu_scale::next_cap;
+        assert_eq!(next_cap(4, 50, 16), 5, "idle processors: one more");
+        assert_eq!(next_cap(16, 50, 16), 16, "never more than the workers");
+        assert_eq!(next_cap(4, 3, 16), 3, "none idle: one fewer");
+        assert_eq!(next_cap(1, 0, 16), 1, "never none");
+        assert_eq!(next_cap(4, 12, 16), 4, "between: as it is");
+        assert_eq!(next_cap(usize::MAX, 12, 16), 16);
+    }
+
+    #[test]
+    fn the_workers_building_ahead_follow_the_machine() {
+        assert_eq!(ahead_threads(2), 2);
+        assert_eq!(ahead_threads(8), 4);
+        assert_eq!(ahead_threads(32), 16);
+        assert_eq!(ahead_threads(128), 16);
+    }
+
+    #[test]
+    fn a_lazy_compute_pipeline_is_built_before_its_first_bind() {
+        let standin = 0x7e57_c0de_usize;
+        submit_lazy(standin, true, Box::new(|| 0x1234), 0);
+        let p = entry(standin).unwrap();
+        let (done, _) = p.cv.wait_timeout_while(p.done.lock().unwrap(), std::time::Duration::from_secs(10), |d| !*d).unwrap();
+        assert!(*done, "nothing bound it, and it was built");
+        drop(done);
+        assert_eq!(p.real.swap(0, Ordering::AcqRel), 0x1234);
+        released(standin);
+    }
+
+    #[test]
     fn a_pipeline_an_earlier_run_used_is_built_ahead_of_its_first_use() {
         let (known, unknown) = (0x7E57_7001usize, 0x7E57_7002usize);
         let (known_key, unknown_key) = (0x5EED_0001u64, 0x5EED_0002u64);
@@ -527,7 +707,7 @@ pub fn resolve(pso: usize) -> usize {
         0 => {
             // a lazy one is wanted now: to the workers
             if !p.sent.swap(true, Ordering::AcqRel) {
-                let _ = queue().lock().unwrap().send(p);
+                let _ = queue(p.compute).lock().unwrap().send(p);
             }
             pso
         }
@@ -586,7 +766,7 @@ fn resolve_within(p: &Arc<Pending>, pso: usize, budget: std::time::Duration) -> 
         return built(p);
     }
     if !p.sent.swap(true, Ordering::AcqRel) {
-        let _ = queue().lock().unwrap().send(p.clone());
+        let _ = queue(p.compute).lock().unwrap().send(p.clone());
     }
     if p.late.load(Ordering::Acquire) {
         return pso;
