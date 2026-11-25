@@ -991,6 +991,8 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                         let raw = real as *mut c_void;
                         let pc = ID3D12PipelineState::from_raw_borrowed(&raw).ok_or("PSO")?;
                         list.SetPipelineState(pc);
+                        // (the recording holds the pipeline until its allocator is reset: `shader_code`)
+                        super::shader_code::bound_on(st.allocator);
                         // (the span names the console's groups, the chain dispatches the folded ones)
                         let t = super::gpu_profile::begin(list.as_raw(), real, super::gpu_profile::Kind::Dispatch, [x, y, z]);
                         let ran = super::real::dispatch_chain::dispatch(&list, real, st.allocator, folded);
