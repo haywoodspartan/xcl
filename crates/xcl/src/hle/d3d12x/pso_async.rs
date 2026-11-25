@@ -9,7 +9,9 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
+#[cfg(test)]
+use std::sync::mpsc;
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 struct Pending {
     /// the build, until a worker – or a bind that cannot wait for the queue – takes it
@@ -25,6 +27,8 @@ struct Pending {
     key: u64,
     /// it was used (`used::note` is told once)
     used: std::sync::atomic::AtomicBool,
+    /// how many times the title has bound it so far: what is built first (`build_order`)
+    uses: std::sync::atomic::AtomicU64,
     /// the stand-in was released before the real pipeline was built
     orphan: std::sync::atomic::AtomicBool,
     /// a bind waited for it longer than `wait_budget`: binds go on without it until it is built
@@ -127,6 +131,7 @@ impl Pending {
     }
 
     fn note_use(&self) {
+        self.uses.fetch_add(1, Ordering::Relaxed);
         if !self.used.swap(true, Ordering::Relaxed) && self.key != 0 {
             used::note(self.key);
         }
@@ -197,21 +202,71 @@ pub type Job = Box<dyn FnOnce() -> usize + Send>;
 /// graphics pipelines it had drawn with waiting – one being built – while 45 builds of compute
 /// programs (tens of seconds each in the driver) held every worker, and the frames it showed
 /// had no scene.
-fn queue(compute: bool) -> &'static Mutex<mpsc::Sender<Arc<Pending>>> {
-    static Q: [OnceLock<Mutex<mpsc::Sender<Arc<Pending>>>>; 2] = [OnceLock::new(), OnceLock::new()];
+///
+/// The workers take the pipeline the title needs most, not the one that came first: one of its
+/// threads waits for it, then the one it has bound most often (`build_order`). In the order they
+/// came, the pipelines a retail title's scene is drawn with every frame stood behind hundreds
+/// it had bound once.
+fn queue(compute: bool) -> &'static WorkQueue {
+    static Q: [OnceLock<WorkQueue>; 2] = [OnceLock::new(), OnceLock::new()];
     Q[compute as usize].get_or_init(|| {
-        let (tx, rx) = mpsc::channel::<Arc<Pending>>();
-        let rx = Arc::new(Mutex::new(rx));
+        let q = WorkQueue { list: Mutex::new(Vec::new()), cv: Condvar::new() };
+        std::thread::spawn(move || queue_workers(compute));
+        q
+    })
+}
+
+/// Pipelines waiting for a worker.
+struct WorkQueue {
+    list: Mutex<Vec<Arc<Pending>>>,
+    cv: Condvar,
+}
+
+impl WorkQueue {
+    fn send(&self, p: Arc<Pending>) {
+        self.list.lock().unwrap().push(p);
+        self.cv.notify_one();
+    }
+
+    /// The next pipeline to build: the first in `build_order` (the earliest of equals).
+    fn recv(&self) -> Arc<Pending> {
+        let mut g = self.list.lock().unwrap();
+        loop {
+            let best = (0..g.len()).max_by_key(|&i| (g[i].build_order(), std::cmp::Reverse(i)));
+            if let Some(i) = best {
+                return g.remove(i);
+            }
+            g = self.cv.wait(g).unwrap();
+        }
+    }
+}
+
+/// What is built first has the larger value: (a title thread waits for it, how many times the
+/// title has bound it).
+pub type BuildOrder = (bool, u64);
+
+impl Pending {
+    fn build_order(&self) -> BuildOrder {
+        (self.demand.lock().unwrap().wanted, self.uses.load(Ordering::Relaxed))
+    }
+}
+
+/// `build_order` of what this worker is building ((false, 0): not a worker's build).
+pub fn build_order_here() -> BuildOrder {
+    BUILDING.with(|b| b.borrow().as_ref().map_or((false, 0), |p| p.build_order()))
+}
+
+fn queue_workers(compute: bool) {
+    {
+        let rx = queue(compute);
         // translation recurses deeply on big programs; DXC itself runs on its own pool
         let n = crate::gpu::recomp::dxc::compile_threads();
         // (as many for each: a worker that waits costs nothing, and the driver compiles are
         // counted where they are made – `real::compile_slots`)
         let name = if compute { "xcl-pso" } else { "xcl-pso-gfx" };
         for k in 0..n {
-            let rx = rx.clone();
             let _ = std::thread::Builder::new().name(format!("{name}-{k}")).stack_size(64 << 20).spawn(move || loop {
-                let next = rx.lock().unwrap().recv();
-                let Ok(p) = next else { return };
+                let p = rx.recv();
                 // (None: a bind took it and builds it itself)
                 let job = p.job.lock().unwrap().take();
                 if let Some(job) = job {
@@ -219,8 +274,7 @@ fn queue(compute: bool) -> &'static Mutex<mpsc::Sender<Arc<Pending>>> {
                 }
             });
         }
-        Mutex::new(tx)
-    })
+    }
 }
 
 /// Release a pipeline state XCL owns (raw pointer, 0 = none).
@@ -261,6 +315,7 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64) {
         compute,
         key,
         used: Default::default(),
+        uses: Default::default(),
         orphan: Default::default(),
         late: Default::default(),
         demand: Default::default(),
@@ -271,7 +326,7 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64) {
         crate::xlog_info!("D3D12.X: pipelines whose shaders are not compiled yet get a stand-in and are built in the background");
     });
     if send {
-        let _ = queue(p.compute).lock().unwrap().send(p);
+        queue(p.compute).send(p);
     } else if used::known(key) || (compute && early_compute()) {
         if let Some(q) = preload() {
             // (graphics ahead of compute, as on the workers: `queue`)
@@ -707,7 +762,7 @@ pub fn resolve(pso: usize) -> usize {
         0 => {
             // a lazy one is wanted now: to the workers
             if !p.sent.swap(true, Ordering::AcqRel) {
-                let _ = queue(p.compute).lock().unwrap().send(p);
+                queue(p.compute).send(p);
             }
             pso
         }
@@ -766,7 +821,7 @@ fn resolve_within(p: &Arc<Pending>, pso: usize, budget: std::time::Duration) -> 
         return built(p);
     }
     if !p.sent.swap(true, Ordering::AcqRel) {
-        let _ = queue(p.compute).lock().unwrap().send(p.clone());
+        queue(p.compute).send(p.clone());
     }
     if p.late.load(Ordering::Acquire) {
         return pso;

@@ -3766,6 +3766,130 @@ fn pso_trace() -> bool {
     *V.get_or_init(|| std::env::var("XCL_PSO_TRACE").is_ok_and(|v| v.trim() == "1"))
 }
 
+/// The driver compiles the workers run at once, over all kinds (`XCL_DRIVER_COMPILES`; default
+/// a third of the processors, 2 – 12). The driver's compiler takes its memory from the process
+/// heap, under one lock: with 46 graphics and 31 compute pipelines of a retail title in it at
+/// once on 32 processors, every one of them stood at that lock (3 s of processor time each in
+/// 4 minutes) and about 200 pipelines the title drew its scene with stayed unbuilt for the
+/// whole run. Graphics pipelines go first, and compute programs – 50 – 110 s each – leave
+/// a quarter of the turns to them.
+mod driver_turns {
+    use std::sync::{Condvar, Mutex, OnceLock};
+
+    /// What goes first has the larger value: (a graphics pipeline, `pso_async::BuildOrder` –
+    /// a title thread waits for it, how often the title has bound it –, bytes of DXIL: of
+    /// pipelines needed alike the largest, which takes the driver longest, starts first).
+    pub type Order = (bool, crate::hle::d3d12x::pso_async::BuildOrder, usize);
+
+    /// (compiles running, the compiles waiting: a number of their own and their order)
+    static STATE: Mutex<(usize, Vec<(u64, Order)>)> = Mutex::new((0, Vec::new()));
+    static FREED: Condvar = Condvar::new();
+
+    pub fn most_for(processors: usize) -> usize {
+        (processors / 3).clamp(2, 12)
+    }
+
+    fn most() -> usize {
+        static V: OnceLock<usize> = OnceLock::new();
+        *V.get_or_init(|| {
+            let processors = std::thread::available_parallelism().map_or(1, |n| n.get());
+            super::env_count(std::env::var("XCL_DRIVER_COMPILES").ok().as_deref(), most_for(processors), 1, 256)
+        })
+    }
+
+    /// Whether a compile may start with `running` compiles in the driver and `graphics_waiting`
+    /// graphics compiles waiting for a turn, of `most` at once.
+    pub fn may_start(graphics: bool, running: usize, graphics_waiting: usize, most: usize) -> bool {
+        if graphics {
+            running < most
+        } else {
+            // (one turn at least for compute: a title that waits for a program gets it)
+            graphics_waiting == 0 && running < (most - (most / 4).max(1)).max(1)
+        }
+    }
+
+    /// Whether the waiting compile `me` is the first of `waiting` in order (the earliest of equals).
+    pub fn is_first(waiting: &[(u64, Order)], me: u64) -> bool {
+        let Some(&(_, mine)) = waiting.iter().find(|w| w.0 == me) else { return true };
+        !waiting.iter().any(|&(id, o)| id != me && (o > mine || (o == mine && id < me)))
+    }
+
+    pub struct Turn;
+
+    /// Wait for a turn; `order` is asked again while waiting (the title binds on).
+    pub fn turn(order: impl Fn() -> Order) -> Turn {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let me = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let graphics = order().0;
+        let mut g = STATE.lock().unwrap();
+        g.1.push((me, order()));
+        loop {
+            let now = order();
+            if let Some(w) = g.1.iter_mut().find(|w| w.0 == me) {
+                w.1 = now;
+            }
+            let graphics_waiting = g.1.iter().filter(|w| w.0 != me && w.1 .0).count();
+            if may_start(graphics, g.0, graphics_waiting, most()) && is_first(&g.1, me) {
+                break;
+            }
+            g = FREED.wait_timeout(g, std::time::Duration::from_millis(250)).unwrap().0;
+        }
+        g.1.retain(|w| w.0 != me);
+        g.0 += 1;
+        drop(g);
+        // (the next in order looks again)
+        FREED.notify_all();
+        Turn
+    }
+
+    impl Drop for Turn {
+        fn drop(&mut self) {
+            STATE.lock().unwrap().0 -= 1;
+            FREED.notify_all();
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn graphics_compiles_go_first_and_compute_leaves_them_turns() {
+            assert_eq!(most_for(32), 10);
+            assert_eq!(most_for(4), 2);
+            assert_eq!(most_for(256), 12);
+            assert!(may_start(true, 9, 0, 10) && !may_start(true, 10, 0, 10));
+            assert!(may_start(false, 7, 0, 10), "compute up to three quarters");
+            assert!(!may_start(false, 8, 0, 10), "the last quarter is kept for graphics");
+            assert!(!may_start(false, 0, 1, 10), "a graphics compile waiting goes first");
+            assert!(may_start(false, 0, 0, 1) && may_start(false, 0, 0, 2), "compute always has a turn");
+        }
+
+        #[test]
+        fn the_compile_the_title_needs_most_goes_first_and_of_equals_the_largest() {
+            let bound = |n: u64| (false, n);
+            // (graphics, (a thread waits, binds), bytes)
+            let waiting = [
+                (0, (false, bound(900), 50_000)),
+                (1, (true, bound(3), 20_000)),
+                (2, (true, bound(3), 400_000)),
+                (3, (true, bound(40), 10_000)),
+                (4, (false, (true, 1), 1_000)),
+                (5, (true, bound(3), 400_000)),
+            ];
+            assert!(is_first(&waiting, 3), "graphics, bound most often");
+            let rest = |gone: &[u64]| waiting.iter().copied().filter(|w| !gone.contains(&w.0)).collect::<Vec<_>>();
+            assert!(is_first(&rest(&[3]), 2), "of pipelines bound alike, the largest – and the earlier of two alike");
+            assert!(!is_first(&rest(&[3]), 5));
+            assert!(is_first(&rest(&[3, 2]), 5));
+            assert!(is_first(&rest(&[3, 2, 5]), 1));
+            assert!(is_first(&rest(&[3, 2, 5, 1]), 4), "compute: the one a thread waits for before the one bound most");
+            assert!(is_first(&rest(&[3, 2, 5, 1, 4]), 0));
+            assert!(is_first(&waiting[..1], 77), "a compile that is not waiting is not held");
+        }
+    }
+}
+
 /// `driver_compile`, with the console record's hash (`fnv64` of the shader container, as in
 /// `[SHADER]` lines and `xcl shaders --measure-pso`) and whether a driver blob was supplied.
 /// Also returns the time spent in the driver alone (not waiting for a slot).
@@ -3773,6 +3897,9 @@ fn driver_compile_identified<R>(kind: &str, bytes: usize, gate: bool, record: Op
     let huge = gate && bytes >= huge_pso_bytes() && std::thread::current().name().is_some_and(|n| n.starts_with("xcl-pso"));
     let waited = std::time::Instant::now();
     let slot = huge.then(|| big_compile_turn(compile_slots(bytes), || big_compile_commit_free(big_compile_headroom(bytes)), super::pso_async::build_is_wanted)).flatten();
+    // (a pipeline made from a kept blob is not compiled)
+    let limited = !record.is_some_and(|(_, cached)| cached) && std::thread::current().name().is_some_and(|n| n.starts_with("xcl-pso"));
+    let _turn = limited.then(|| driver_turns::turn(|| (super::pso_async::building_graphics_here(), super::pso_async::build_order_here(), bytes)));
     let waited = waited.elapsed();
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
     let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1;
@@ -4182,6 +4309,13 @@ pub(crate) mod driver_cache {
                 crate::xlog_info!("D3D12.X: {n} compute pipelines made from the driver's blob of an earlier run (kept on disk)");
             }
         } else {
+            // A removed device refuses every pipeline, with any blob: the blob is not at fault
+            // and is kept. Dropped then, a run that ended in a device removal took the blobs of
+            // every pipeline the title made after it off the disk, and the next run compiled
+            // them all again.
+            if super::device_is_removed() {
+                return;
+            }
             if let Some(p) = p {
                 let _ = std::fs::remove_file(p);
             }
@@ -6753,6 +6887,12 @@ pub(super) mod dispatch_trace {
             crate::xlog_error!("dispatch trace: list {list:#x}: record {record:016x}, {dxil} B, {}x{}x{}", g[0], g[1], g[2]);
         }
     }
+}
+
+/// Whether the device was removed (false: no device yet).
+fn device_is_removed() -> bool {
+    let raw = device_raw();
+    unsafe { ID3D12Device::from_raw_borrowed(&raw) }.is_some_and(|dev| unsafe { dev.GetDeviceRemovedReason() }.is_err())
 }
 
 /// If the device was removed: the reason, DRED's page fault (address, the allocations around
