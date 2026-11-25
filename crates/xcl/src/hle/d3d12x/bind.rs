@@ -62,6 +62,8 @@ fn count(k: usize) {
             "D3D12.X: console code so far: {} draws with translated pipelines ({} skipped, {} with PC pipelines), {} dispatches ({} skipped); coherent {coherent_used}/{coherent_total} MB, sparse {sparse_used} MB, {blocks} blocks held for {allocators} allocators",
             c[DRAWS], c[DRAWS_SKIPPED], c[DRAWS_PC], c[DISPATCHES], c[DISPATCHES_SKIPPED],
         );
+        let ((wg, wc), (rg, rc)) = super::pso_async::wanted_backlog();
+        crate::xlog_info!("D3D12.X: pipelines the title has used that are not built yet: {wg} graphics, {wc} compute; builds running now: {rg} graphics, {rc} compute");
     }
 }
 
@@ -1008,6 +1010,7 @@ unsafe fn translated_dispatch(this: *mut c_void, list: &ID3D12GraphicsCommandLis
         trace_fullscreen(this, pso, [x, y, z]);
     }
     bind_abi(this, list, pso, false)?;
+    super::real::dispatch_trace::dispatch(this as usize, pso, [x, y, z]);
     super::real::dispatch_chain::dispatch(list, pso, with(this, |s| s.allocator), [x, y, z])
 }
 

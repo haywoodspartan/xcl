@@ -465,14 +465,19 @@ pub fn wait_for_memory(wanted: &Wanted) -> MemorySlot {
 
 /// DXC workers (`compile_threads`, each with its own compiler and a `DXC_STACK` stack), started
 /// on first use; callers wait for their job.
-fn pool() -> &'static std::sync::Mutex<std::sync::mpsc::Sender<Job>> {
-    static POOL: OnceLock<std::sync::Mutex<std::sync::mpsc::Sender<Job>>> = OnceLock::new();
-    POOL.get_or_init(|| {
+///
+/// `graphics`: the workers that compile only for graphics pipelines (a quarter as many, 2 – 8).
+/// In one queue, the shaders of pipelines a title draws its scene with waited behind compute
+/// programs whose compiles take 30 – 75 s each (`pso_async::queue`).
+fn pool(graphics: bool) -> &'static std::sync::Mutex<std::sync::mpsc::Sender<Job>> {
+    static POOL: [OnceLock<std::sync::Mutex<std::sync::mpsc::Sender<Job>>>; 2] = [OnceLock::new(), OnceLock::new()];
+    POOL[graphics as usize].get_or_init(|| {
         let (tx, rx) = std::sync::mpsc::channel::<Job>();
         let rx = std::sync::Arc::new(std::sync::Mutex::new(rx));
-        for k in 0..compile_threads() {
+        let (n, name) = if graphics { ((compile_threads() / 4).clamp(2, 8), "xcl-dxc-gfx") } else { (compile_threads(), "xcl-dxc") };
+        for k in 0..n {
             let rx = rx.clone();
-            let _ = std::thread::Builder::new().name(format!("xcl-dxc-{k}")).stack_size(DXC_STACK).spawn(move || loop {
+            let _ = std::thread::Builder::new().name(format!("{name}-{k}")).stack_size(DXC_STACK).spawn(move || loop {
                 let job = match rx.lock().unwrap().recv() {
                     Ok(j) => j,
                     Err(_) => return,
@@ -492,8 +497,31 @@ fn pool() -> &'static std::sync::Mutex<std::sync::mpsc::Sender<Job>> {
 pub fn compile(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result<Vec<u8>, String> {
     let (reply, rx) = std::sync::mpsc::channel();
     let job = Job { src: src.into(), entry: entry.into(), profile: profile.into(), extra: extra.iter().map(|s| s.to_string()).collect(), reply, wanted: crate::hle::d3d12x::pso_async::wanted_here() };
-    pool().lock().unwrap().send(job).map_err(|_| "DXC: no compile threads".to_string())?;
-    rx.recv().map_err(|_| "DXC: the compile thread exited".to_string())?
+    pool(crate::hle::d3d12x::pso_async::building_graphics_here()).lock().unwrap().send(job).map_err(|_| "DXC: no compile threads".to_string())?;
+    // A compile that goes on and on holds whoever waits for it (a title's thread at a bind):
+    // say which one, and keep its source for a report.
+    let t0 = std::time::Instant::now();
+    let mut told = 0u64;
+    loop {
+        match rx.recv_timeout(std::time::Duration::from_secs(30)) {
+            Ok(r) => {
+                if told != 0 {
+                    crate::xlog_warn!("DXC: the {profile} compile of {} B of HLSL ended after {} s", src.len(), t0.elapsed().as_secs());
+                }
+                return r;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Err("DXC: the compile thread exited".to_string()),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                let s = t0.elapsed().as_secs();
+                if s >= told * 2 {
+                    told = s;
+                    let file = cache_dir().join(format!("slow-{:016x}.hlsl", cache_key(src, entry, profile)));
+                    let kept = !file.exists() && std::fs::write(&file, src).is_ok();
+                    crate::xlog_warn!("DXC: a {profile} compile of {} B of HLSL ({entry}) is still running after {s} s{}", src.len(), if kept { format!(" – source kept in {}", file.display()) } else { String::new() });
+                }
+            }
+        }
+    }
 }
 
 /// HLSL longer than this is compiled at -O0 (`compile_here`): a console compute program this big

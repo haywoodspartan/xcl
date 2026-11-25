@@ -3967,10 +3967,27 @@ fn huge_pso_bytes() -> usize {
     *V.get_or_init(|| env_count(std::env::var("XCL_HUGE_PSO_BYTES").ok().as_deref(), 256 << 10, 1, usize::MAX))
 }
 
-/// Huge driver compiles at once on the workers (default 1, `XCL_HUGE_PSO_CONCURRENCY`).
+/// Huge driver compiles at once on the workers (`XCL_HUGE_PSO_CONCURRENCY`; default: what the
+/// machine has, `huge_compiles_for`).
 fn huge_pso_concurrency() -> usize {
     static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *V.get_or_init(|| env_count(std::env::var("XCL_HUGE_PSO_CONCURRENCY").ok().as_deref(), 1, 1, 64))
+    *V.get_or_init(|| {
+        use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+        let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+        m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+        let ram = if unsafe { GlobalMemoryStatusEx(&mut m) } == 0 { 0 } else { m.ullTotalPhys };
+        let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+        env_count(std::env::var("XCL_HUGE_PSO_CONCURRENCY").ok().as_deref(), huge_compiles_for(cores, ram), 1, 64)
+    })
+}
+
+/// Huge driver compiles at once on a machine with `cores` logical processors and `ram` bytes
+/// of memory: one for every 4 processors and every 16 GB, 1 – 8. One at a time left a
+/// 32-processor machine with 180 GB compiling a retail title's large compute pipelines
+/// (50 – 85 s each) in a row, the next ones waiting 130 – 140 s for the slot; the 8 – 16 GB
+/// machines the limit of one was measured on keep it.
+fn huge_compiles_for(cores: usize, ram: u64) -> usize {
+    (cores / 4).min((ram >> 34) as usize).clamp(1, 8)
 }
 
 /// Hard cap on concurrent huge (`>= 256 KB`) driver compiles even when wanted by a title bind
@@ -4023,8 +4040,19 @@ static BIG_COMPILES: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::n
 const GIANT_DRIVER_COMPILE: usize = 4 << 20;
 static GIANT_COMPILES: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 1, wanted_most: 1 };
 
+/// The big compiles of graphics pipelines have slots of their own: sharing `BIG_COMPILES`, the
+/// pipelines a retail title drew its scene with (about 250 of them) all waited here for compute
+/// programs that hold a slot 50 – 110 s each, and its frames showed no scene.
+static GRAPHICS_COMPILES: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 0, wanted_most: 0 };
+
 fn compile_slots(bytes: usize) -> &'static Slots {
-    if bytes >= GIANT_DRIVER_COMPILE { &GIANT_COMPILES } else { &BIG_COMPILES }
+    if bytes >= GIANT_DRIVER_COMPILE {
+        &GIANT_COMPILES
+    } else if super::pso_async::building_graphics_here() {
+        &GRAPHICS_COMPILES
+    } else {
+        &BIG_COMPILES
+    }
 }
 
 /// A driver compile of `bytes` of DXIL through `build`: a huge one on an `xcl-pso*` worker
@@ -4203,6 +4231,17 @@ mod big_compile_tests {
         t.into_iter().for_each(|h| h.join().unwrap());
         assert_eq!(PEAK.load(Ordering::SeqCst), 2, "12 concurrent wanted huge compiles must cap at 2");
         assert_eq!(*S.n.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn huge_compiles_at_once_follow_the_machine() {
+        assert_eq!(huge_compiles_for(8, 8 << 30), 1);
+        assert_eq!(huge_compiles_for(8, 16 << 30), 1);
+        assert_eq!(huge_compiles_for(16, 32 << 30), 2);
+        assert_eq!(huge_compiles_for(32, 180 << 30), 8);
+        assert_eq!(huge_compiles_for(4, 256 << 30), 1, "few processors: memory does not add compiles");
+        assert_eq!(huge_compiles_for(128, 16 << 30), 1, "little memory: processors do not");
+        assert_eq!(huge_compiles_for(0, 0), 1);
     }
 
     #[test]
@@ -4393,6 +4432,7 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
         PSO_USER_SGPRS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, n);
     }
     note_translated_compute(hr, ppv);
+    dispatch_trace::pipeline(*ppv as usize, record, dxil.len());
     crate::xlog_info!(
         "D3D12.X: compute PSO with the translated console CS ({} B DXIL, {} ms{})",
         dxil.len(),
@@ -7390,6 +7430,52 @@ mod dred_tests {
     }
 }
 
+/// `XCL_TRACE_DISPATCH=1`: the last translated dispatches (list, pipeline, groups), logged
+/// with each pipeline's console record when the device is removed – which program a hung
+/// dispatch ran.
+pub(super) mod dispatch_trace {
+    use std::collections::{HashMap, VecDeque};
+    use std::sync::{Mutex, OnceLock};
+
+    const KEPT: usize = 2048;
+    static PIPELINES: Mutex<Option<HashMap<usize, (u64, usize)>>> = Mutex::new(None);
+    static LAST: Mutex<VecDeque<(usize, usize, [u32; 3])>> = Mutex::new(VecDeque::new());
+
+    pub fn on() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var("XCL_TRACE_DISPATCH").is_ok_and(|v| v.trim() == "1"))
+    }
+
+    pub fn pipeline(pso: usize, record: u64, dxil: usize) {
+        if on() {
+            PIPELINES.lock().unwrap().get_or_insert_with(HashMap::new).insert(pso, (record, dxil));
+        }
+    }
+
+    pub fn dispatch(list: usize, pso: usize, groups: [u32; 3]) {
+        if on() {
+            let mut g = LAST.lock().unwrap();
+            if g.len() == KEPT {
+                g.pop_front();
+            }
+            g.push_back((list, pso, groups));
+        }
+    }
+
+    pub fn dump() {
+        if !on() {
+            return;
+        }
+        let pipelines = PIPELINES.lock().unwrap();
+        let last = LAST.lock().unwrap();
+        crate::xlog_error!("dispatch trace: the last {} translated dispatches (list: pipeline record, DXIL bytes, groups)", last.len());
+        for (list, pso, g) in last.iter() {
+            let (record, dxil) = pipelines.as_ref().and_then(|m| m.get(pso)).copied().unwrap_or_default();
+            crate::xlog_error!("dispatch trace: list {list:#x}: record {record:016x}, {dxil} B, {}x{}x{}", g[0], g[1], g[2]);
+        }
+    }
+}
+
 /// If the device was removed: the reason, DRED's page fault (address, the allocations around
 /// it) and the operations each command list got to – into the log, once.
 pub fn log_device_removed() {
@@ -7401,6 +7487,7 @@ pub fn log_device_removed() {
         return;
     }
     crate::xlog_error!("D3D12 device removed: {:#x} {}", e.code().0 as u32, e.message());
+    dispatch_trace::dump();
     unsafe {
         let Ok(dred) = dev.cast::<ID3D12DeviceRemovedExtendedData>() else { return };
         if let Ok(pf) = dred.GetPageFaultAllocationOutput() {
