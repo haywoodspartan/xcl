@@ -143,7 +143,16 @@ static ENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::ne
 /// status is not 0, every other thread – and the log written out. abort() leaves no other
 /// trace: the buffered log lines went with the process.
 unsafe extern "system" fn hk_nt_terminate_process(h: isize, status: i32) -> i32 {
-    if (h == 0 || h == -1) && !ENDING.swap(true, Ordering::AcqRel) {
+    if h == 0 || h == -1 {
+        note_ending(status);
+    }
+    let orig: unsafe extern "system" fn(isize, i32) -> i32 = std::mem::transmute(ORIG_NT_TERMINATE.load(Ordering::Acquire));
+    orig(h, status)
+}
+
+/// The process ends: logged once, and the report and the log written out.
+unsafe fn note_ending(status: i32) {
+    if !ENDING.swap(true, Ordering::AcqRel) {
         let probe = 0usize;
         let (tid, stack) = (windows_sys::Win32::System::Threading::GetCurrentThreadId(), stack_callers_n(&probe as *const usize as usize, 16));
         if status != 0 {
@@ -152,15 +161,34 @@ unsafe extern "system" fn hk_nt_terminate_process(h: isize, status: i32) -> i32 
         } else {
             crate::xlog_info!("process ends (thread {tid}); on the stack: {stack}");
         }
+        crate::report::write_final(None);
         crate::log::flush();
     }
-    let orig: unsafe extern "system" fn(isize, i32) -> i32 = std::mem::transmute(ORIG_NT_TERMINATE.load(Ordering::Acquire));
-    orig(h, status)
+}
+
+static ORIG_RTL_EXIT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// ntdll!RtlExitUserProcess (ExitProcess): the end of the process is noted here, before ntdll
+/// takes the process heap's lock for the rest of the exit. `hk_nt_terminate_process` runs
+/// under that lock; a segment heap's lock (`xcl.manifest`) is not one its owner can take
+/// again, and what it logged there waited for the lock its own thread held, for ever.
+unsafe extern "system" fn hk_rtl_exit_user_process(status: i32) {
+    note_ending(status);
+    let orig: unsafe extern "system" fn(i32) = std::mem::transmute(ORIG_RTL_EXIT.load(Ordering::Acquire));
+    orig(status)
+}
+
+/// The process is ending (`hk_nt_terminate_process` saw it and wrote the report).
+pub fn ending() -> bool {
+    ENDING.load(Ordering::Acquire)
 }
 
 pub fn install_crash_handler() {
     unsafe {
         if let Err(e) = hooks::hook("ntdll.dll", "NtTerminateProcess", hk_nt_terminate_process as usize, &ORIG_NT_TERMINATE) {
+            crate::xlog_warn!("{e}");
+        }
+        if let Err(e) = hooks::hook("ntdll.dll", "RtlExitUserProcess", hk_rtl_exit_user_process as usize, &ORIG_RTL_EXIT) {
             crate::xlog_warn!("{e}");
         }
         SetUnhandledExceptionFilter(Some(unhandled_filter));
