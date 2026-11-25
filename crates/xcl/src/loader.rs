@@ -455,9 +455,13 @@ pub fn on_tls_event(reason: u32) {
             }
         },
         0 => {
-            // DLL_PROCESS_DETACH (ExitProcess): write the report while everything is alive.
-            crate::report::write_final(None);
-            crate::log::flush();
+            // DLL_PROCESS_DETACH (ExitProcess): the report, unless it was written when the
+            // process began to end (`eh::hk_nt_terminate_process`) – the other threads are gone
+            // by now, and what they held of the heap is held for good.
+            if !crate::eh::ending() {
+                crate::report::write_final(None);
+                crate::log::flush();
+            }
         }
         _ => {}
     }

@@ -54,7 +54,15 @@ fn main() {
     // xcl.exe without high-entropy ASLR: the title's memory then lies under 2^40, which a
     // retail title's BVH builder requires of its GPU addresses (#585, PR #631)
     match std::env::var("CARGO_CFG_TARGET_ENV").as_deref() {
-        Ok("msvc") => println!("cargo:rustc-link-arg-bin=xcl=/HIGHENTROPYVA:NO"),
+        Ok("msvc") => {
+            println!("cargo:rustc-link-arg-bin=xcl=/HIGHENTROPYVA:NO");
+            // the process heap as a segment heap (`xcl.manifest`)
+            let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("xcl.manifest");
+            println!("cargo:rerun-if-changed={}", manifest.display());
+            println!("cargo:rustc-link-arg-bin=xcl=/MANIFEST:EMBED");
+            println!("cargo:rustc-link-arg-bin=xcl=/MANIFESTUAC:NO");
+            println!("cargo:rustc-link-arg-bin=xcl=/MANIFESTINPUT:{}", manifest.display());
+        }
         Ok("gnu") => println!("cargo:rustc-link-arg-bin=xcl=-Wl,--disable-high-entropy-va"),
         _ => {}
     }
