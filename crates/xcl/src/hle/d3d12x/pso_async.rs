@@ -83,7 +83,17 @@ static CODE_PIPELINES: [AtomicUsize; 2] = [AtomicUsize::new(0), AtomicUsize::new
 pub fn code_in_use_line() -> String {
     let mb = |k: usize| CODE_IN_USE[k].load(Ordering::Relaxed) >> 20;
     let n = |k: usize| CODE_PIPELINES[k].load(Ordering::Relaxed);
-    format!("{} MB of driver code in use: {} MB of {} graphics pipelines, {} MB of {} compute pipelines", mb(0) + mb(1), mb(0), n(0), mb(1), n(1))
+    // (`shader_code` counts what may be released: the pieces of a split program with it, and
+    // nothing where there is no limit)
+    format!(
+        "{} MB of driver code in use: {} MB of {} graphics pipelines, {} MB of {} compute pipelines; {} MB by the release budget's count",
+        mb(0) + mb(1),
+        mb(0),
+        n(0),
+        mb(1),
+        n(1),
+        super::shader_code::used() >> 20
+    )
 }
 
 /// Whether one of the title's threads waits for the pipeline, and the preload worker building it.

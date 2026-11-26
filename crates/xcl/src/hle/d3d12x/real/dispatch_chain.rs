@@ -79,12 +79,81 @@ impl Chain {
         // (a driver compile on the title's thread, of the largest programs: the title is held
         // while it lasts, as in any other long PC call)
         let _call = super::super::pso_async::pc_call();
+        self.build_whole_form()
+    }
+
+    /// The whole form, built here unless another thread has built it meanwhile (`build_whole`:
+    /// one build of it, which a title's thread that needs it waits for).
+    unsafe fn build_whole_form(&self) -> Result<ID3D12PipelineState, String> {
         let _guard = self.build_whole.lock().unwrap();
         if let Some(p) = self.whole.get() { return Ok(p.clone()); }
         let p = self.builder.pipeline(&self.whole_code, &pc_iid(Kind::PipelineState)).ok_or("whole compute pipeline")?;
         let _ = self.whole.set(p.clone());
         Ok(p)
     }
+}
+
+/// Workers that build whole forms ahead (`whole_ahead`), unless `XCL_CHAIN_WHOLE_THREADS` says
+/// how many (1 to 32). How many of them compile at once is the gate's word
+/// (`XCL_HUGE_PSO_CONCURRENCY`).
+const WHOLE_AHEAD_THREADS: usize = 8;
+
+fn whole_ahead_threads(v: Option<&str>) -> usize {
+    v.and_then(|v| v.trim().parse::<usize>().ok()).filter(|&n| n > 0).map_or(WHOLE_AHEAD_THREADS, |n| n.min(32))
+}
+
+/// `chain`'s whole form is built ahead, on a worker (`XCL_CHAIN_WHOLE_AHEAD=0`: not, and never
+/// outside a running title).
+///
+/// An ExecuteIndirect of a split program runs its whole form (`bind::execute_indirect`), which is
+/// built at its first one on the title's thread: about a megabyte of DXIL, 30 – 80 s in an
+/// NVIDIA driver, kept on disk apart from the whole form an offline pass makes (the chain's root
+/// signature). A retail title's first world frame has hundreds of them one after another: its
+/// thread built ten in a 10-minute run and no frame came. The workers build them as soon as the
+/// pieces are there, a few at a time (their names put them behind the gate of big driver
+/// compiles, `driver_compile_identified`), and the title's thread waits only for one that is not
+/// done yet.
+fn whole_ahead(chain: Arc<Chain>) {
+    use std::sync::mpsc;
+    static QUEUE: OnceLock<Option<Mutex<mpsc::Sender<Arc<Chain>>>>> = OnceLock::new();
+    let queue = QUEUE.get_or_init(|| {
+        if !whole_ahead_on(std::env::var("XCL_CHAIN_WHOLE_AHEAD").ok().as_deref(), crate::state::boot().is_some()) {
+            return None;
+        }
+        let (tx, rx) = mpsc::channel::<Arc<Chain>>();
+        let rx = Arc::new(Mutex::new(rx));
+        for k in 0..whole_ahead_threads(std::env::var("XCL_CHAIN_WHOLE_THREADS").ok().as_deref()) {
+            let rx = rx.clone();
+            let _ = std::thread::Builder::new().name(format!("xcl-pso-whole-{k}")).stack_size(64 << 20).spawn(move || {
+                unsafe {
+                    use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_LOWEST};
+                    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
+                }
+                loop {
+                    // (the lock is held for the wait only, not for the build)
+                    let next = rx.lock().unwrap().recv();
+                    let Ok(chain) = next else { return };
+                    static BUILT: AtomicU64 = AtomicU64::new(0);
+                    if unsafe { chain.build_whole_form() }.is_ok() {
+                        let n = BUILT.fetch_add(1, Ordering::Relaxed) + 1;
+                        if n.is_power_of_two() {
+                            crate::xlog_info!("D3D12.X: {n} whole forms of split compute programs built ahead of their first ExecuteIndirect");
+                        }
+                    }
+                }
+            });
+        }
+        Some(Mutex::new(tx))
+    });
+    if let Some(tx) = queue {
+        let _ = tx.lock().unwrap().send(chain);
+    }
+}
+
+/// Whether whole forms are built ahead: in a running title (`title`), unless the switch
+/// (`XCL_CHAIN_WHOLE_AHEAD`) says 0.
+fn whole_ahead_on(switch: Option<&str>, title: bool) -> bool {
+    title && switch.map_or(true, |v| v.trim() != "0")
 }
 
 static CHAINS: LazyLock<Mutex<HashMap<usize, Arc<Chain>>>> = LazyLock::new(Default::default);
@@ -114,7 +183,8 @@ pub(super) unsafe fn build(this: *mut c_void, create: PsoFn, desc: &D3D12_COMPUT
     PROGRAMS.fetch_add(1, Ordering::Relaxed);
     PIECES.fetch_add(plan.pieces.len() as u64, Ordering::Relaxed);
     *result = first.into_raw();
-    CHAINS.lock().unwrap().insert(*result as usize, chain);
+    CHAINS.lock().unwrap().insert(*result as usize, chain.clone());
+    whole_ahead(chain);
     Some(rs)
 }
 
@@ -275,9 +345,22 @@ pub(in crate::hle::d3d12x) unsafe fn dispatch(list: &ID3D12GraphicsCommandList, 
 
 #[cfg(test)]
 mod tests {
-    use super::{scratch_bytes, LEAST};
+    use super::{scratch_bytes, whole_ahead_on, LEAST};
 
     const MB: u64 = 1 << 20;
+
+    /// Whole forms are built ahead in a running title unless the switch says 0; never in a tool
+    /// or a test, which make their pipelines with no title to wait for them.
+    #[test]
+    fn whole_forms_are_built_ahead_only_in_a_running_title() {
+        assert!(whole_ahead_on(None, true));
+        assert!(whole_ahead_on(Some("1"), true));
+        assert!(!whole_ahead_on(Some(" 0 "), true));
+        assert!(!whole_ahead_on(None, false));
+        assert!(!whole_ahead_on(Some("1"), false));
+        // eight workers unless the switch names another count, of 1 to 32
+        assert_eq!([None, Some("0"), Some("x"), Some(" 3 "), Some("14"), Some("400")].map(super::whole_ahead_threads), [8, 8, 8, 3, 14, 32]);
+    }
 
     #[test]
     fn a_list_recorded_after_another_goes_on_in_its_scratch() {
