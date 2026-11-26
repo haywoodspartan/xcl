@@ -1294,7 +1294,7 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, Vec<(usize, 
     }
     p.last = Instant::now();
     if !p.dumps.is_empty() {
-        match fence::wait(&p.fence, p.value, &p.dev, Some(p.event), 2000) {
+        match fence::wait(&p.fence, p.value, &p.dev, Some(p.event), frame_dump_wait_ms()) {
             Ok(()) => {
                 for dump in p.dumps.drain(..) {
                     if dump.tag.starts_with("twin") {
@@ -1344,6 +1344,19 @@ fn frame_dump_due() -> bool {
         Err(_) => 0,
     });
     every > 0 && PRESENTS.load(Ordering::Relaxed) % every == 20.min(every - 1)
+}
+
+/// `XCL_FRAME_DUMP_WAIT_MS`: how long a frame dump waits for its copy (2000). The copy is queued
+/// behind the title's work, and a frame that takes the GPU longer than this left no dump at all:
+/// a retail title's world at a frame in 3 s dumped nothing past its loading screen.
+fn frame_dump_wait_ms() -> u32 {
+    static MS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *MS.get_or_init(|| frame_dump_wait_of(std::env::var("XCL_FRAME_DUMP_WAIT_MS").ok().as_deref()))
+}
+
+/// The wait for the switch's value `v`: 2000 ms unless it names 1 ms or more.
+fn frame_dump_wait_of(v: Option<&str>) -> u32 {
+    v.and_then(|v| v.trim().parse::<u32>().ok()).filter(|&ms| ms > 0).unwrap_or(2000)
 }
 
 /// Frames shown so far.
@@ -1783,6 +1796,15 @@ mod frame_dump_tests {
     use super::*;
     use super::super::real::D3d12Stats;
     use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+
+    /// A dump's copy is waited for 2 s unless the switch names a time.
+    #[test]
+    fn a_frame_dumps_wait_follows_the_switch() {
+        assert_eq!(frame_dump_wait_of(None), 2000);
+        assert_eq!(frame_dump_wait_of(Some(" 30000 ")), 30000);
+        assert_eq!(frame_dump_wait_of(Some("0")), 2000);
+        assert_eq!(frame_dump_wait_of(Some("soon")), 2000);
+    }
 
     #[test]
     fn reports_without_frame_dumps_remain_readable() {
