@@ -548,6 +548,15 @@ pub fn video_memory() -> Option<(u64, u64, u64)> {
     }
 }
 
+/// Bytes of the driver's blob of PC pipeline `pso` (`GetCachedBlob`), 0 when it gives none: what
+/// stands for the pipeline's compiled code in `pso_async`'s count of the code in use (an NVIDIA
+/// driver keeps that code in one heap of 512 MB and removes the device past it).
+pub(super) fn pipeline_code_bytes(pso: usize) -> u64 {
+    let raw = pso as *mut c_void;
+    let Some(p) = (unsafe { ID3D12PipelineState::from_raw_borrowed(&raw) }) else { return 0 };
+    unsafe { p.GetCachedBlob() }.map_or(0, |b| unsafe { b.GetBufferSize() } as u64)
+}
+
 /// How far `used` is past `budget` (bytes; None: within it, or no budget known).
 pub fn over_video_budget(used: u64, budget: u64) -> Option<u64> {
     (budget != 0 && used > budget).then(|| used - budget)
@@ -4417,10 +4426,35 @@ mod skip_cs_tests {
     }
 }
 
-/// Huge driver compiles at once on the workers (default 1, `XCL_HUGE_PSO_CONCURRENCY`).
+/// Huge driver compiles at once on the workers (`XCL_HUGE_PSO_CONCURRENCY`; by default
+/// `huge_pso_default` of the processors).
 fn huge_pso_concurrency() -> usize {
     static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *V.get_or_init(|| env_count(std::env::var("XCL_HUGE_PSO_CONCURRENCY").ok().as_deref(), 1, 1, 64))
+    *V.get_or_init(|| {
+        let processors = std::thread::available_parallelism().map_or(4, |n| n.get());
+        env_count(std::env::var("XCL_HUGE_PSO_CONCURRENCY").ok().as_deref(), huge_pso_default(processors), 1, 64)
+    })
+}
+
+/// Huge driver compiles at once on a machine with `processors` logical processors: a quarter of
+/// them, from 1 to 8. One at a time was the measure while every compile fought for the process
+/// heap's one lock (20 at once were slower in total than 1 – 2); with the segment heap
+/// (`xcl.manifest`) eight at once took 40 s for the longest program of a retail title's world
+/// where one at a time took 194 s, and with one at a time a 10-minute run never finished the
+/// pipelines that scene binds.
+fn huge_pso_default(processors: usize) -> usize {
+    (processors / 4).clamp(1, 8)
+}
+
+#[cfg(test)]
+mod huge_pso_default_tests {
+    /// A quarter of the processors compile big programs at once: never none, and no more than 8
+    /// on a machine with many.
+    #[test]
+    fn huge_compiles_at_once_follow_the_processors() {
+        use super::huge_pso_default;
+        assert_eq!([1, 4, 8, 16, 32, 128].map(huge_pso_default), [1, 1, 2, 4, 8, 8]);
+    }
 }
 
 /// Hard cap on concurrent huge (`>= 256 KB`) driver compiles even when wanted by a title bind
@@ -9204,6 +9238,8 @@ pub fn log_device_removed() {
         return;
     }
     crate::xlog_error!("D3D12 device removed: {:#x} {}", e.code().0 as u32, e.message());
+    // (an NVIDIA driver removes the device when the code of the pipelines in use passes 512 MB)
+    crate::xlog_error!("at the removal: {}", super::pso_async::code_in_use_line());
     // (to rule the system's memory in or out: a removal with no fault of the GPU's had 30 GB of
     // commit left)
     let (commit, limit) = crate::host::system_commit();
