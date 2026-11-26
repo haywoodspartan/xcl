@@ -315,6 +315,19 @@ impl Drop for Recording {
 }
 
 static RECORDINGS: LazyLock<Mutex<HashMap<usize, Vec<Arc<Recording>>>>> = LazyLock::new(Default::default);
+
+pub(in crate::hle::d3d12x) struct DetachedRecordings(Vec<Arc<Recording>>);
+
+impl DetachedRecordings {
+    pub(in crate::hle::d3d12x) fn release(self) {
+        drop(self.0);
+    }
+}
+
+pub(in crate::hle::d3d12x) fn detach_recordings(allocator: usize) -> Option<DetachedRecordings> {
+    RECORDINGS.lock().unwrap().remove(&allocator).map(DetachedRecordings)
+}
+
 /// list → the allocator it records on and the scratch its chains share: they are dispatched one
 /// after another, with a barrier between them (the recordings keep it alive)
 static SHARED: LazyLock<Mutex<HashMap<usize, (usize, std::sync::Weak<Scratch>)>>> = LazyLock::new(Default::default);
@@ -382,12 +395,14 @@ unsafe fn scratch_for(dev: &ID3D12Device, list: usize, allocator: usize, needed:
 }
 
 pub(in crate::hle::d3d12x) fn allocator_reset(allocator: usize) {
-    drop(let_go(allocator));
+    if let Some(recordings) = detach_recordings(allocator) {
+        recordings.release();
+    }
 }
 
 /// What `allocator`'s recordings keep, for the caller to drop.
 pub(in crate::hle::d3d12x) fn let_go(allocator: usize) -> impl Sized {
-    RECORDINGS.lock().unwrap().remove(&allocator)
+    detach_recordings(allocator).map(|r| r.0)
 }
 
 /// The pieces after the first of the split program whose first piece is `pso`.
