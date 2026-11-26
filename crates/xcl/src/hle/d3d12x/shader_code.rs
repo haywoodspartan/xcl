@@ -77,6 +77,37 @@ pub fn limit() -> usize {
     })
 }
 
+/// How many bytes of compiled code may be in use at all (`XCL_SHADER_CODE_CAP_MB`; 0: no cap).
+/// Default: 384 MB where there is a `limit`, none elsewhere. At it, a pipeline not in use yet
+/// keeps its stand-in (`pso_async`'s `take`): its draws and dispatches are left out until code is
+/// released.
+///
+/// `limit` releases what no recording holds, and a retail title's first world frame holds more
+/// than the driver's heap takes in its recordings alone: the device was removed at its first
+/// submit with 419 MB counted here, in every run. Left-out work in one frame is the lesser loss.
+pub fn cap() -> usize {
+    static C: OnceLock<usize> = OnceLock::new();
+    *C.get_or_init(|| cap_of(std::env::var("XCL_SHADER_CODE_CAP_MB").ok().as_deref(), limit()))
+}
+
+/// The cap in bytes for the switch's value `v` and the release limit `limit` (bytes).
+fn cap_of(v: Option<&str>, limit: usize) -> usize {
+    match v.and_then(|v| v.trim().parse::<usize>().ok()) {
+        Some(mb) => mb << 20,
+        None if limit != 0 => 384 << 20,
+        None => 0,
+    }
+}
+
+/// The code in use is at its `cap`.
+pub fn over_cap() -> bool {
+    over(used(), cap())
+}
+
+fn over(used: usize, cap: usize) -> bool {
+    cap != 0 && used >= cap
+}
+
 pub fn now_ms() -> u64 {
     static T: OnceLock<Instant> = OnceLock::new();
     T.get_or_init(Instant::now).elapsed().as_millis() as u64
@@ -217,6 +248,21 @@ pub fn choose(pipelines: &[(usize, u64)], used: usize, limit: usize, now: u64) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The cap is 384 MB where code is released at a limit, none where it is not, and what the
+    /// switch says otherwise (0: none); the code in use is over it from the cap on.
+    #[test]
+    fn the_cap_follows_the_limit_unless_the_switch_names_one() {
+        const MB: usize = 1 << 20;
+        assert_eq!(cap_of(None, 320 * MB), 384 * MB);
+        assert_eq!(cap_of(None, 0), 0);
+        assert_eq!(cap_of(Some(" 450 "), 320 * MB), 450 * MB);
+        assert_eq!(cap_of(Some("0"), 320 * MB), 0);
+        assert_eq!(cap_of(Some("x"), 0), 0);
+        assert!(!over(383 * MB, 384 * MB));
+        assert!(over(384 * MB, 384 * MB));
+        assert!(!over(usize::MAX, 0), "no cap");
+    }
 
     #[test]
     fn the_longest_unused_go_first_and_only_as_many_as_it_takes() {
