@@ -275,7 +275,6 @@ impl Pending {
                 f();
             }
         }
-        self.count_code();
     }
 
     /// Its driver code is in use from its first use once built (`CODE_IN_USE`): counted once.
@@ -2579,24 +2578,50 @@ impl Pending {
     /// The pipeline to bind for `pso`: this thread's until it is bound (`shader_code`).
     fn take(&self, pso: usize) -> usize {
         let mut first = false;
+        let mut kept_out = false;
         let real = {
             let _done = self.done.lock().unwrap();
             let real = self.real.load(Ordering::Acquire);
             if real == 0 {
                 return self.stand(pso);
             }
-            if self.releasable && self.compute {
-                unsafe { super::shader_code::Ref::new(real) }.map(super::shader_code::hold);
+            // A graphics pipeline whose code is not in use yet, with the code in use at its cap
+            // (`shader_code::cap`): its stand-in, as while it was being built. Its draws are left
+            // out until code is released; with its code in use too the driver would remove the
+            // device, and nothing at all would be drawn after that. Not a compute pipeline: what a
+            // left-out pass would have written is what later work reads – with compute programs
+            // kept out too, a retail title's ExecuteIndirect after two of them faulted on the
+            // GPU (0x887a0006, DRED state 7) 20 s into its world.
+            if self.releasable && !self.compute && self.code.load(Ordering::Acquire) == 0 && super::shader_code::over_cap() {
+                kept_out = true;
+                0
+            } else {
+                if self.releasable && self.compute {
+                    unsafe { super::shader_code::Ref::new(real) }.map(super::shader_code::hold);
+                }
+                if self.releasable && self.code.load(Ordering::Acquire) == 0 {
+                    self.code.store(unsafe { super::shader_code::count_all(real) }.max(1), Ordering::Release);
+                    first = true;
+                }
+                real
             }
-            if self.releasable && self.code.load(Ordering::Acquire) == 0 {
-                self.code.store(unsafe { super::shader_code::count_all(real) }.max(1), Ordering::Release);
-                first = true;
-            }
-            real
         };
-        if first {
+        if first || kept_out {
             release_unused(super::shader_code::limit());
         }
+        if kept_out {
+            static KEPT_OUT: AtomicUsize = AtomicUsize::new(0);
+            let n = KEPT_OUT.fetch_add(1, Ordering::Relaxed) + 1;
+            if n.is_power_of_two() {
+                crate::xlog_warn!(
+                    "D3D12.X: {n} binds got a stand-in for a built graphics pipeline so far: the shader code in use is at its cap ({} of {} MB, XCL_SHADER_CODE_CAP_MB) – their draws are left out",
+                    super::shader_code::used() >> 20,
+                    super::shader_code::cap() >> 20
+                );
+            }
+            return self.stand(pso);
+        }
+        self.count_code();
         real
     }
 }
