@@ -5182,6 +5182,13 @@ pub(crate) mod driver_cache {
                 crate::xlog_info!("D3D12.X: {n} pipelines made from the driver's blob of an earlier run (kept on disk)");
             }
         } else {
+            // A removed device refuses every pipeline, with any blob: the blob is not at fault
+            // and is kept. Dropped then, a run that ended in a device removal took the blobs of
+            // every pipeline the title made after it off the disk, and the next run compiled
+            // them all again.
+            if super::device_is_removed() {
+                return;
+            }
             if let Some(p) = p {
                 let _ = std::fs::remove_file(p);
             }
@@ -9167,6 +9174,12 @@ mod dred_tests {
             assert_eq!((node, done), (std::ptr::from_ref(&nodes[i]), 0));
         }
     }
+}
+
+/// Whether the device was removed (false: no device yet).
+fn device_is_removed() -> bool {
+    let raw = device_raw();
+    unsafe { ID3D12Device::from_raw_borrowed(&raw) }.is_some_and(|dev| unsafe { dev.GetDeviceRemovedReason() }.is_err())
 }
 
 /// If the device was removed: the reason, DRED's page fault (address, the allocations around
