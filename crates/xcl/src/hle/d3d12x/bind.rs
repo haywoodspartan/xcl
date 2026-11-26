@@ -130,15 +130,39 @@ impl TwoPassBuf {
     }
 }
 
-/// Most bytes of two-pass buffers alive at once (`XCL_TWO_PASS_MB`, 1024 MiB by default): those
-/// recordings hold until the GPU is done with them, and the free ones. Each is a committed buffer
-/// in video memory, on a card that may be nearly full.
+/// Most bytes of two-pass buffers alive at once (`XCL_TWO_PASS_MB`; by default
+/// `two_pass_default_mb` of the card's budget): those recordings hold until the GPU is done with
+/// them, and the free ones. Each is a committed buffer in video memory, on a card that may be
+/// nearly full.
 fn two_pass_cap() -> u64 {
     static CAP: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *CAP.get_or_init(|| {
-        let mb = std::env::var("XCL_TWO_PASS_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(1024);
+        let mb = std::env::var("XCL_TWO_PASS_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or_else(|| two_pass_default_mb(super::real::video_memory().map(|(_, _, budget)| budget)));
         mb.saturating_mul(1 << 20)
     })
+}
+
+/// MiB of two-pass buffers alive at once on a card whose budget for the process is `budget`
+/// bytes (None: not known): a quarter of it, from 1024 to 8192 MiB. With 1024 MiB on a 24 GB
+/// card a retail title's scene had 80 508 of its mesh draws refused in 300 s; it holds about
+/// 3 GiB of these buffers when none is refused.
+fn two_pass_default_mb(budget: Option<u64>) -> u64 {
+    budget.map_or(1024, |b| ((b >> 20) / 4).clamp(1024, 8192))
+}
+
+#[cfg(test)]
+mod two_pass_default_tests {
+    /// A quarter of the card's budget, never under the 1024 MiB of a card whose budget is not
+    /// known, and no more than 8192 MiB.
+    #[test]
+    fn two_pass_buffers_follow_the_cards_budget() {
+        use super::two_pass_default_mb;
+        let gib = |n: u64| Some(n << 30);
+        assert_eq!([None, gib(2), gib(8), gib(22), gib(48)].map(two_pass_default_mb), [1024, 1024, 2048, 5632, 8192]);
+    }
 }
 
 /// `bytes` more counted in `alive` if it stays within `cap` (whether it did).

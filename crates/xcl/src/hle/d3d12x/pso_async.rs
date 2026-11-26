@@ -59,6 +59,22 @@ struct Pending {
     left_out: std::sync::atomic::AtomicU64,
     /// when a worker, or a bind, took its build (`run_job`)
     build_started: OnceLock<std::time::Instant>,
+    /// bytes of its driver blob counted in `CODE_IN_USE` (0: not counted – not used yet, not
+    /// built yet, or the driver gives no blob)
+    code: std::sync::atomic::AtomicU64,
+}
+
+/// Driver code of the pipelines the title used and has not released: bytes and pipelines,
+/// graphics then compute (`Pending::count_code`, `released`).
+static CODE_IN_USE: [std::sync::atomic::AtomicU64; 2] = [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
+static CODE_PIPELINES: [AtomicUsize; 2] = [AtomicUsize::new(0), AtomicUsize::new(0)];
+
+/// The code in use as a line: "412 MB of driver code in use: 150 MB of 610 graphics pipelines,
+/// 262 MB of 480 compute pipelines".
+pub fn code_in_use_line() -> String {
+    let mb = |k: usize| CODE_IN_USE[k].load(Ordering::Relaxed) >> 20;
+    let n = |k: usize| CODE_PIPELINES[k].load(Ordering::Relaxed);
+    format!("{} MB of driver code in use: {} MB of {} graphics pipelines, {} MB of {} compute pipelines", mb(0) + mb(1), mb(0), n(0), mb(1), n(1))
 }
 
 /// Whether one of the title's threads waits for the pipeline, and the preload worker building it.
@@ -252,6 +268,25 @@ impl Pending {
                 f();
             }
         }
+        self.count_code();
+    }
+
+    /// Its driver code is in use from its first use once built (`CODE_IN_USE`): counted once.
+    fn count_code(&self) {
+        if self.code.load(Ordering::Relaxed) != 0 {
+            return;
+        }
+        let real = self.real.load(Ordering::Acquire);
+        if real == 0 {
+            return;
+        }
+        // (1 at least: a pipeline whose driver gives no blob is looked at once)
+        let bytes = super::real::pipeline_code_bytes(real).max(1);
+        if self.code.compare_exchange(0, bytes, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+            let k = usize::from(self.compute);
+            CODE_IN_USE[k].fetch_add(bytes, Ordering::Relaxed);
+            CODE_PIPELINES[k].fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 
@@ -364,6 +399,8 @@ fn start_stats() {
             let mut last = Stats::default();
             let mut last_put_off = PutOffStats::default();
             let mut ticks = 0u32;
+            // (MB of code in use at its last line: one every 16 MB more or less)
+            let mut code_logged = 0u64;
             loop {
                 std::thread::sleep(std::time::Duration::from_secs(2));
                 let now = stats();
@@ -376,6 +413,11 @@ fn start_stats() {
                     crate::xlog_info!("{line}");
                 }
                 last_put_off = now;
+                let code = (CODE_IN_USE[0].load(Ordering::Relaxed) + CODE_IN_USE[1].load(Ordering::Relaxed)) >> 20;
+                if code.abs_diff(code_logged) >= 16 {
+                    code_logged = code;
+                    crate::xlog_info!("D3D12.X: {}", code_in_use_line());
+                }
                 ticks += 1;
                 if ticks % 15 == 0 {
                     if let Some(line) = left_out_line() {
@@ -814,6 +856,7 @@ impl Pending {
             on_use: Default::default(),
             left_out: Default::default(),
             build_started: OnceLock::new(),
+            code: Default::default(),
         }
     }
 
@@ -1167,12 +1210,38 @@ fn preload() -> Option<&'static Preload> {
         })
         .as_ref()?;
     STARTED.call_once(|| {
-        let n = (crate::gpu::recomp::dxc::compile_threads() / 4).clamp(2, 4);
-        for _ in 0..n {
+        for _ in 0..ahead_threads() {
             spawn_preload_worker(q);
         }
     });
     Some(q)
+}
+
+/// Workers of the backlog (`XCL_PSO_AHEAD_THREADS`; by default `ahead_threads_of` the compile
+/// threads).
+fn ahead_threads() -> usize {
+    let most = crate::gpu::recomp::dxc::compile_threads();
+    std::env::var("XCL_PSO_AHEAD_THREADS").ok().and_then(|v| v.trim().parse::<usize>().ok()).filter(|&n| n > 0).map_or(ahead_threads_of(most), |n| n.min(64))
+}
+
+/// Backlog workers for `compile_threads` compile threads: half of them, from 2 to 16. They build
+/// the pipelines earlier runs used before the title binds them; a bind that finds one unbuilt
+/// builds it on the title's own thread, one after another. With 4 workers a retail title's
+/// thread built 131 graphics pipelines itself at 7 s each and showed no frame for 8 minutes
+/// while the processors idled. Their big driver compiles still take turns at the gate
+/// (`real::big_compile_turn`), and they run at the lowest priority.
+fn ahead_threads_of(compile_threads: usize) -> usize {
+    (compile_threads / 2).clamp(2, 16)
+}
+
+#[cfg(test)]
+mod ahead_threads_tests {
+    /// Half of the compile threads build ahead: at least 2, at most 16.
+    #[test]
+    fn backlog_workers_follow_the_compile_threads() {
+        use super::ahead_threads_of;
+        assert_eq!([1, 3, 7, 15, 31, 63].map(ahead_threads_of), [2, 2, 3, 7, 15, 16]);
+    }
 }
 
 /// One more worker of the backlog (`preload`).
@@ -2801,6 +2870,13 @@ pub fn resolve_for_bind(pso: usize) -> usize {
 /// the worker's result is then released when it arrives).
 pub fn released(pso: usize) -> usize {
     let Some(p) = PENDING.remove(pso) else { return 0 };
+    // (its code is no longer in use: `CODE_IN_USE`)
+    let code = p.code.swap(0, Ordering::Relaxed);
+    if code != 0 {
+        let k = usize::from(p.compute);
+        CODE_IN_USE[k].fetch_sub(code, Ordering::Relaxed);
+        CODE_PIPELINES[k].fetch_sub(1, Ordering::Relaxed);
+    }
     {
         let done = p.done.lock().unwrap();
         if *done {
