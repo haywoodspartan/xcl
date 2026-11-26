@@ -54,6 +54,11 @@ struct Pending {
     warm: Mutex<Option<Warm>>,
     /// what its first use tells besides `used::note` (`on_first_use`)
     on_use: Mutex<Option<OnUse>>,
+    /// DispatchMesh / ExecuteIndirect draws that got its stand-in and were left out
+    /// (`gave_standin`), for `left_out_line`
+    left_out: std::sync::atomic::AtomicU64,
+    /// when a worker, or a bind, took its build (`run_job`)
+    build_started: OnceLock<std::time::Instant>,
 }
 
 /// Whether one of the title's threads waits for the pipeline, and the preload worker building it.
@@ -95,6 +100,7 @@ thread_local! {
 fn run_job(p: &Pending, job: Job) -> usize {
     JOB_START.with(|s| s.set(Some(std::time::Instant::now())));
     JOB_HUGE.with(|h| h.set(false));
+    let _ = p.build_started.set(std::time::Instant::now());
     let real = job();
     JOB_START.with(|s| s.set(None));
     if JOB_HUGE.with(|h| h.replace(false)) {
@@ -357,6 +363,7 @@ fn start_stats() {
         let _ = std::thread::Builder::new().name("xcl-pso-stats".into()).spawn(|| {
             let mut last = Stats::default();
             let mut last_put_off = PutOffStats::default();
+            let mut ticks = 0u32;
             loop {
                 std::thread::sleep(std::time::Duration::from_secs(2));
                 let now = stats();
@@ -369,6 +376,12 @@ fn start_stats() {
                     crate::xlog_info!("{line}");
                 }
                 last_put_off = now;
+                ticks += 1;
+                if ticks % 15 == 0 {
+                    if let Some(line) = left_out_line() {
+                        crate::xlog_info!("{line}");
+                    }
+                }
             }
         });
     });
@@ -799,6 +812,8 @@ impl Pending {
             warned: Default::default(),
             warm: Mutex::new(warm),
             on_use: Default::default(),
+            left_out: Default::default(),
+            build_started: OnceLock::new(),
         }
     }
 
@@ -2814,7 +2829,54 @@ pub fn is_pending(pso: usize) -> bool {
 /// stand-in binds: `shared`): the bind has the stand-in, also when the build finished since (a
 /// failed build's stand-in is what draws for good).
 pub fn gave_standin(pso: usize, resolved: usize) -> bool {
-    entry(pso).is_some_and(|p| resolved == p.stand(pso) && (!*p.done.lock().unwrap() || p.real.load(Ordering::Acquire) != 0))
+    let Some(p) = entry(pso) else { return false };
+    let standin = resolved == p.stand(pso) && (!*p.done.lock().unwrap() || p.real.load(Ordering::Acquire) != 0);
+    if standin {
+        // (the draw is left out: `left_out_line` names the pipelines with the most of them)
+        p.left_out.fetch_add(1, Ordering::Relaxed);
+    }
+    standin
+}
+
+/// The pipelines whose draws are left out while they are built (`gave_standin`), for a line every
+/// 30 s while there are any: how many, the draws left out so far, and the eight with the most –
+/// what each is, and whether its build runs (and since when) or still waits for a worker. A scene
+/// that stays empty is a few pipelines here, each with thousands of draws.
+fn left_out_line() -> Option<String> {
+    let (mut graphics, mut compute, mut draws) = (0usize, 0usize, 0u64);
+    let mut most: Vec<(u64, String)> = Vec::new();
+    PENDING.for_each(|pso, p| {
+        let n = p.left_out.load(Ordering::Relaxed);
+        if n == 0 || *p.done.lock().unwrap() {
+            return;
+        }
+        if p.compute {
+            compute += 1;
+        } else {
+            graphics += 1;
+        }
+        draws += n;
+        let state = match p.build_started.get() {
+            Some(t) => format!("its build runs for {} s", t.elapsed().as_secs()),
+            None if p.sent.load(Ordering::Acquire) => "waits for a worker".to_string(),
+            None => "not sent to the workers".to_string(),
+        };
+        let what = match (p.compute, p.record) {
+            (true, 0) => format!("compute {pso:#x}"),
+            (true, record) => format!("cs {record:016x}"),
+            (false, _) => format!("graphics, shaders {:016x}", p.key),
+        };
+        most.push((n, format!("{what}: {n} draws, {state}")));
+    });
+    if most.is_empty() {
+        return None;
+    }
+    most.sort_by(|a, b| b.0.cmp(&a.0));
+    let list: Vec<String> = most.into_iter().take(8).map(|(_, s)| s).collect();
+    Some(format!(
+        "D3D12.X: draws are left out for {graphics} graphics and {compute} compute pipelines still being built ({draws} draws so far); the most: {}",
+        list.join("; ")
+    ))
 }
 
 /// Whether a dispatch with `pso` would wait for its build now (`resolve_wait`): a pipeline still

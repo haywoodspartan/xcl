@@ -629,6 +629,19 @@ struct Pages {
 unsafe impl Send for Pages {}
 
 /// device raw pointer → its pages (None inside: tiled tier < 2 on this device)
+/// The queues the textures' tile mappings go through, for `late_release`: the last Release of a
+/// texture waits for them as for the title's queues. It did not, and a retail title entering
+/// its world, where it makes and ends thousands of textures a second, ended ones whose mapping
+/// or unmapping was still on this queue (debug layer id 921, "CORRUPTION: … is referenced by GPU
+/// operations in-flight on Command Queue 'xcl vram tile-mapping queue'").
+/// (A list of its own: `PAGES` is held while resources are released.)
+static TILE_QUEUES: Mutex<Vec<ID3D12CommandQueue>> = Mutex::new(Vec::new());
+
+/// The tile mapping queues (`TILE_QUEUES`).
+pub(super) fn tile_queues() -> Vec<ID3D12CommandQueue> {
+    TILE_QUEUES.lock().unwrap().clone()
+}
+
 static PAGES: Mutex<std::collections::BTreeMap<usize, Option<Pages>>> = Mutex::new(std::collections::BTreeMap::new());
 
 impl Pages {
@@ -642,6 +655,7 @@ impl Pages {
         }
         let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).ok()?;
         let _ = queue.SetName(windows::core::w!("xcl vram tile-mapping queue"));
+        TILE_QUEUES.lock().unwrap().push(queue.clone());
         let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
         crate::xlog_info!("D3D12.X: textures in title memory: tiled resources on 64 KiB pages of video memory, one per page of the title's");
         Some(Pages {
