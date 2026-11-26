@@ -143,6 +143,28 @@ impl Chain {
     }
 }
 
+/// A split program's whole form is used before anything needs it: taken from the driver's cache
+/// in the pieces' place when the pipeline is made (`translated_compute_pso_once`), and built in the
+/// background from the program's first ExecuteIndirect on (`execute_indirect`), which every later
+/// one then binds next to the pieces. `XCL_SPLIT_WHOLE`: 1 yes, 0 no; by default not where the
+/// compiled code in use is limited (`shader_code::limit`, NVIDIA): a bound whole form's code is in
+/// use with the pieces', and a retail title's world had 554 MB in use with the whole forms of its
+/// split programs bound, past the 512 MB the driver takes (#2403). The whole form of a program
+/// that lost slabs is still built (`Recording::read_back`).
+pub(in crate::hle::d3d12x) fn whole_ahead() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| whole_ahead_of(std::env::var("XCL_SPLIT_WHOLE").ok().as_deref(), super::super::shader_code::limit()))
+}
+
+/// `whole_ahead` for the switch's value `v` and the limit of the code in use (bytes, 0: none).
+fn whole_ahead_of(v: Option<&str>, limit: usize) -> bool {
+    match v.map(str::trim) {
+        Some("1") => true,
+        Some("0") => false,
+        _ => limit == 0,
+    }
+}
+
 /// The thread of `want_whole`: an `xcl-pso*` one, so a huge whole form waits for its turn
 /// (`driver_compile`) as the workers' builds do
 fn whole_thread() -> std::thread::Builder {
@@ -501,8 +523,9 @@ pub(in crate::hle::d3d12x) unsafe fn execute_indirect(list: &ID3D12GraphicsComma
     let pieces = chain.tail.len() as u32 + 1;
     let buffer = pso::chain_commands_buffer(dev, rounds, pieces, commands).ok_or("no buffer for the commands of a chained ExecuteIndirect")?;
     // not built: asked for now, so that it is there before an ExecuteIndirect of the program
-    // needs more slabs than its rounds (until then those are lost)
-    if full.is_none() {
+    // needs more slabs than its rounds (until then those are lost); where the code in use is
+    // limited, only once one did (`whole_ahead`, `Recording::read_back`)
+    if full.is_none() && whole_ahead() {
         chain.want_whole();
     }
     let first = ID3D12PipelineState::from_raw_borrowed(&(pso as *mut c_void)).ok_or("first compute piece")?.clone();
@@ -516,6 +539,8 @@ pub(in crate::hle::d3d12x) unsafe fn execute_indirect(list: &ID3D12GraphicsComma
         // (each round's pieces start after a UAV barrier), with nothing of the chain before it:
         // after the pieces' ExecuteIndirects it did not run right on an RTX 3080 Ti (#2404)
         if let Some((full, sig)) = &full {
+            // (its code is in use from here, as the pieces' is: `shader_code`)
+            super::super::shader_code::count(full.as_raw() as usize);
             list.SetPipelineState(full);
             list.ExecuteIndirect(sig, commands, &buffer, at + 16, None::<&ID3D12Resource>, 0);
         }
@@ -579,6 +604,18 @@ mod tests {
         // one group always fits, whatever the bounds say
         assert_eq!(scratch_bytes(9 * MB, 9 * MB, 4 * MB, None, 400 * MB, 384 * MB), (9 * MB, true));
         assert_eq!(scratch_bytes(9 * MB, 9 * MB, 4 * MB, Some(MB), 400 * MB, 384 * MB), (9 * MB, true));
+    }
+
+    /// Whole forms are used ahead of need where no limit holds the code in use down, and not
+    /// where one does; the switch says otherwise either way.
+    #[test]
+    fn whole_forms_ahead_of_need_only_without_a_limit_on_the_code_in_use() {
+        use super::whole_ahead_of;
+        assert!(whole_ahead_of(None, 0));
+        assert!(!whole_ahead_of(None, 320 << 20));
+        assert!(whole_ahead_of(Some(" 1 "), 320 << 20));
+        assert!(!whole_ahead_of(Some("0"), 0));
+        assert!(whole_ahead_of(Some("x"), 0) && !whole_ahead_of(Some("x"), 1));
     }
 
     #[test]

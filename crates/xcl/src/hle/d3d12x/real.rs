@@ -4528,6 +4528,14 @@ mod huge_pso_default_tests {
         use super::huge_pso_default;
         assert_eq!([1, 4, 8, 16, 32, 128].map(huge_pso_default), [1, 1, 2, 4, 8, 8]);
     }
+
+    /// A build the title waits for has one slot more than the background ones, however many
+    /// those are: 2 where one runs at a time, as before.
+    #[test]
+    fn a_wanted_huge_compile_has_a_slot_past_the_background_ones() {
+        use super::huge_pso_wanted_default;
+        assert_eq!([1, 2, 8].map(huge_pso_wanted_default), [2, 3, 9]);
+    }
 }
 
 /// Hard cap on concurrent huge (`>= 256 KB`) driver compiles even when wanted by a title bind
@@ -4538,8 +4546,15 @@ fn huge_pso_wanted_concurrency() -> usize {
     static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
         let base = huge_pso_concurrency();
-        env_count(std::env::var("XCL_HUGE_PSO_WANTED_CONCURRENCY").ok().as_deref(), base.max(2), base, 64)
+        env_count(std::env::var("XCL_HUGE_PSO_WANTED_CONCURRENCY").ok().as_deref(), huge_pso_wanted_default(base), base, 64)
     })
+}
+
+/// The cap for builds a title thread waits for where `base` background ones run at once: one
+/// more, so that such a build overtakes a background one also when every background slot is
+/// taken (with a cap equal to `base` it waited behind all of them).
+fn huge_pso_wanted_default(base: usize) -> usize {
+    base + 1
 }
 
 /// A count from the environment: `default` when unset or not a number, clamped to the
@@ -5045,7 +5060,8 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
         return Some(Err(()));
     }
     let record = crate::gpu::shader::fnv64(cs);
-    let warm = compiled.dispatch_chain.as_ref().and_then(|_| {
+    // (the whole form a driver cache has, in the pieces' place: `dispatch_chain::whole_ahead`)
+    let warm = compiled.dispatch_chain.as_ref().filter(|_| dispatch_chain::whole_ahead()).and_then(|_| {
         let rs = abi_rs_for(this, &compiled.samplers)?;
         let result = compute_container(this, f, d, rs, &dxil, record, riid, ppv, ComputeBuild::CachedWhole);
         (result.0 >= 0).then_some((rs, result))

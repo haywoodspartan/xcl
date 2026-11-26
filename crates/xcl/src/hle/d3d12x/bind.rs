@@ -2427,7 +2427,8 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
                 }
             }
             if let Some(whole) = &whole {
-                // (past the hook, as `bind_abi` binds the pipeline)
+                // (past the hook, as `bind_abi` binds the pipeline; its code is in use from here)
+                super::shader_code::count(whole.as_raw() as usize);
                 super::list_x::set_compute_pipeline(this, whole.as_raw());
             }
             ei_work(this, sig, super::targets::RAN);

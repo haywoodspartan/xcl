@@ -148,7 +148,9 @@ fn split_compute_prefers_the_offline_whole_pipeline() {
     fs::create_dir_all(&input).unwrap();
     fs::write(input.join("guarded.bin"), blob).unwrap();
     let run = |cmd: &mut Command| {
-        let out = cmd.env("XCL_DIRECT_DXIL","1")
+        // (XCL_SPLIT_WHOLE: the cached whole form is preferred on every adapter, also where the
+        // code in use is limited and the pieces are the default)
+        let out = cmd.env("XCL_DIRECT_DXIL","1").env("XCL_SPLIT_WHOLE","1")
             .env("XCL_DXIL_CACHE",&cache).env("XCL_PSO_DISK_CACHE","1").output().unwrap();
         assert!(out.status.success(), "{}\n{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
     };
