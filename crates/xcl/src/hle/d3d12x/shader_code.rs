@@ -67,13 +67,36 @@ fn nvidia() -> Option<bool> {
     }
 }
 
+/// The megabytes the driver reserves for this process's compiled code: what an NVIDIA profile
+/// sets for the executable (`xcl nvprofile install`, `gpu::nvprofile`), 512 without one.
+fn heap_mb() -> usize {
+    static H: OnceLock<usize> = OnceLock::new();
+    *H.get_or_init(|| {
+        let exe = std::env::current_exe().ok().and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()));
+        let set = exe.and_then(|e| crate::gpu::nvprofile::status(&e).ok().flatten()).map(|bytes| (bytes >> 20) as usize);
+        if let Some(mb) = set {
+            crate::xlog_info!("D3D12.X: the NVIDIA profile of this executable reserves {mb} MB for compiled shader code");
+        }
+        set.unwrap_or(512)
+    })
+}
+
+/// The megabytes of compute code to keep in use under a driver heap of `heap_mb`: 320 under the
+/// driver's own 512 MB; under a bigger heap 13/32 of it, which leaves the graphics pipelines
+/// room: they are never released and only grow. Under 1 GiB a retail title's world was removed
+/// at 750 s with 640 MB kept (645 MB compute + 235 MB graphics in use, about 990 MB in the heap)
+/// and not in 556 s with 420 MB kept (541 + 232).
+fn default_limit_mb(heap_mb: usize) -> usize {
+    if heap_mb <= 512 { 320 } else { heap_mb * 13 / 32 }
+}
+
 /// How many bytes of compiled code to keep in use (0: no limit).
 pub fn limit() -> usize {
     static L: OnceLock<usize> = OnceLock::new();
     *L.get_or_init(|| {
         let mb = std::env::var("XCL_SHADER_CODE_MB").ok().and_then(|v| v.trim().parse().ok());
         // (the tests give `pso_async` pipelines that are none)
-        mb.unwrap_or_else(|| if !cfg!(test) && nvidia() == Some(true) { 320usize } else { 0 }) << 20
+        mb.unwrap_or_else(|| if !cfg!(test) && nvidia() == Some(true) { default_limit_mb(heap_mb()) } else { 0 }) << 20
     })
 }
 
@@ -87,14 +110,19 @@ pub fn limit() -> usize {
 /// submit with 419 MB counted here, in every run. Left-out work in one frame is the lesser loss.
 pub fn cap() -> usize {
     static C: OnceLock<usize> = OnceLock::new();
-    *C.get_or_init(|| cap_of(std::env::var("XCL_SHADER_CODE_CAP_MB").ok().as_deref(), limit()))
+    *C.get_or_init(|| {
+        let limit = limit();
+        cap_of(std::env::var("XCL_SHADER_CODE_CAP_MB").ok().as_deref(), limit, if limit != 0 { heap_mb() } else { 512 })
+    })
 }
 
-/// The cap in bytes for the switch's value `v` and the release limit `limit` (bytes).
-fn cap_of(v: Option<&str>, limit: usize) -> usize {
+/// The cap in bytes for the switch's value `v`, the release limit `limit` (bytes) and the
+/// driver's heap of `heap_mb`: none under a heap a profile made bigger, where no draw has to be
+/// left out for the code to fit.
+fn cap_of(v: Option<&str>, limit: usize, heap_mb: usize) -> usize {
     match v.and_then(|v| v.trim().parse::<usize>().ok()) {
         Some(mb) => mb << 20,
-        None if limit != 0 => 384 << 20,
+        None if limit != 0 && heap_mb <= 512 => 384 << 20,
         None => 0,
     }
 }
@@ -254,14 +282,23 @@ mod tests {
     #[test]
     fn the_cap_follows_the_limit_unless_the_switch_names_one() {
         const MB: usize = 1 << 20;
-        assert_eq!(cap_of(None, 320 * MB), 384 * MB);
-        assert_eq!(cap_of(None, 0), 0);
-        assert_eq!(cap_of(Some(" 450 "), 320 * MB), 450 * MB);
-        assert_eq!(cap_of(Some("0"), 320 * MB), 0);
-        assert_eq!(cap_of(Some("x"), 0), 0);
+        assert_eq!(cap_of(None, 320 * MB, 512), 384 * MB);
+        assert_eq!(cap_of(None, 0, 512), 0);
+        assert_eq!(cap_of(Some(" 450 "), 320 * MB, 512), 450 * MB);
+        assert_eq!(cap_of(Some("0"), 320 * MB, 512), 0);
+        assert_eq!(cap_of(Some("x"), 0, 512), 0);
+        // a profile's bigger heap: no cap unless the switch names one
+        assert_eq!(cap_of(None, 416 * MB, 1024), 0);
+        assert_eq!(cap_of(Some("700"), 416 * MB, 1024), 700 * MB);
         assert!(!over(383 * MB, 384 * MB));
         assert!(over(384 * MB, 384 * MB));
         assert!(!over(usize::MAX, 0), "no cap");
+    }
+
+    /// 320 MB of compute code are kept under the driver's own heap, 13/32 of a bigger one.
+    #[test]
+    fn the_code_kept_in_use_follows_the_drivers_heap() {
+        assert_eq!([256, 512, 1024, 2048].map(default_limit_mb), [320, 320, 416, 832]);
     }
 
     #[test]
